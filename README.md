@@ -1,0 +1,67 @@
+# Finding Floating Number Operations
+
+Purpose: To find parsimonious arithmetic expressions that explain "surprising" floating-point values.
+
+People are often startled to see values like `0.05000000000001137` where they expected `0.05`. This tool finds a short sequence of elementary arithmetic operations on common literals that could have produced the unexpected value.
+
+## How it works
+
+**Search** uses bottom-up dynamic programming keyed on *literal count* (the number of numeric constants in the expression):
+
+- Level 1 — atomic literals: `0.1`, `0.2`, …, `1`, `2`, …, `20`, `100`, `200`, …
+- Level k — all `(level-i  op  level-(k-i))` pairs under `+`, `−`, `×`, `÷`
+
+Float values are stored by exact IEEE-754 bit pattern, so each reachable float is represented once by its simplest known expression. The search terminates as soon as the target bit pattern is matched.
+
+**Template exploration** runs after a match is found. Each distinct literal in the expression is treated as a parameter and swept over ~12 000 candidates (integers 1–10 000, powers of 2 up to 2³⁰, common decimal fractions, negatives). Same-valued literals are varied together — they are the same "variable". The output shows which values produce the same surprising result, revealing the underlying pattern.
+
+### Example
+
+```
+Target: 0.05000000000001137
+
+Expression : (200 - (200 - 0.05))
+Literals   : 3  (operations: 2)
+
+Template : (N0 - (N0 - N1))
+  N0 = 200.0,  N1 = 0.05
+
+Varying N0 — positive values that work (384):
+  129.0  130.0  …  512.0          ← exactly two IEEE-754 binades (2⁷ to 2⁹)
+
+Varying N1 — values that work (1):
+  0.05                             ← the error is specific to this literal
+```
+
+The 384-integer range [129, 512] is two complete binary binade intervals (2⁷–2⁸ and 2⁸–2⁹). Rounding behaviour changes at powers of two, which is exactly what IEEE-754 arithmetic predicts.
+
+## Usage
+
+```sh
+# Default demo target
+python3 find_float.py
+
+# Provide your own target
+python3 find_float.py 0.30000000000000004
+python3 find_float.py 0.6000000000000001
+
+# Tune the search
+python3 find_float.py 0.05000000000001137 --max-literals 6 --time-limit 120
+
+# Skip template exploration
+python3 find_float.py 0.30000000000000004 --no-explore
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `target` | `0.05000000000001137` | Float value to explain |
+| `-m`, `--max-literals` | `7` | Maximum literals in the expression |
+| `-t`, `--time-limit` | `60` | Wall-clock search limit (seconds) |
+| `--no-explore` | off | Skip template exploration |
+| `-q`, `--quiet` | off | Suppress progress output |
+
+## Requirements
+
+Python 3.10+, no dependencies beyond the standard library.
