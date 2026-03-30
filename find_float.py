@@ -4,14 +4,17 @@ float-gen: Find parsimonious arithmetic expressions that produce a given float.
 
 Given a "surprising" floating-point value, searches for the simplest sequence
 of elementary arithmetic operations on common literal values that could have
-produced it.  After finding an expression it explores the template — sweeping
-each distinct literal over a wide range to reveal which values produce the
-same result and which do not.
+produced it.  After finding all equally-simple expressions it explores the
+template — sweeping each distinct literal over a wide range to reveal which
+values produce the same result and which do not.
 
 Algorithm: bottom-up dynamic programming keyed on literal count.
   - Level 1: atomic literals (0.1, 0.2, ..., 1, 2, ..., 20, ...)
   - Level k: all (level-i op level-(k-i)) combinations for 1 ≤ i < k
   - Float values are deduped by exact IEEE-754 bit pattern.
+  - The entire matching level is scanned so ALL equally-parsimonious
+    expressions are returned, not just the first one found.
+  - Commutative pairs (a+b / b+a, a*b / b*a) are normalised to one form.
   - After a match, each distinct literal is swept independently over a large
     candidate set; same-valued literals are replaced together (they represent
     the same "variable" in the template).
@@ -84,7 +87,7 @@ def build_atoms() -> dict[int, Expr]:
             return
         b = float_bits(v)
         if b not in pool:
-            pool[b] = Expr(v, label, 1)  # leaf: left/op/right stay None
+            pool[b] = Expr(v, label, 1)
 
     # Small positive integers — the most natural operands
     for n in range(1, 21):
@@ -131,55 +134,67 @@ def _expand(
     target_bits: int,
     known: dict[int, Expr],
     staging: dict[int, Expr],
-) -> "Expr | None":
+    hits: list[Expr],
+    seen_texts: set[str],
+) -> None:
     """
-    Apply all four binary ops to (ea, eb).  Deposit previously-unseen results
-    into *staging*.  Return a matching Expr immediately if the target is hit.
+    Apply all four binary ops to (ea, eb).
+
+    - Results equal to the target are appended to *hits* (deduplicated by
+      normalised text: commutative ops are sorted so a+b and b+a count once).
+    - Other previously-unseen results are deposited into *staging*.
     """
     av, bv = ea.value, eb.value
     n = ea.n_lits + eb.n_lits
 
-    candidates = [
-        (av + bv, f"({ea.text} + {eb.text})", '+'),
-        (av - bv, f"({ea.text} - {eb.text})", '-'),
-        (av * bv, f"({ea.text} * {eb.text})", '*'),
+    candidates: list[tuple[float, str, str, Expr, Expr]] = [
+        (av + bv, '+', ea, eb),
+        (av - bv, '-', ea, eb),
+        (av * bv, '*', ea, eb),
     ]
     if bv != 0.0:
-        candidates.append((av / bv, f"({ea.text} / {eb.text})", '/'))
+        candidates.append((av / bv, '/', ea, eb))
 
-    for rv, text, op in candidates:
+    for rv, op, left, right in candidates:
         if not math.isfinite(rv):
             continue
-        bits = float_bits(rv)
-        new_expr = Expr(rv, text, n, left=ea, op=op, right=eb)
-        if bits == target_bits:
-            return new_expr
-        if bits not in known and bits not in staging:
-            staging[bits] = new_expr
 
-    return None
+        # Normalise commutative ops to avoid (a+b) and (b+a) as duplicates
+        if op in ('+', '*') and left.text > right.text:
+            left, right = right, left
+
+        text = f"({left.text} {op} {right.text})"
+        bits = float_bits(rv)
+
+        if bits == target_bits:
+            if text not in seen_texts:
+                seen_texts.add(text)
+                hits.append(Expr(rv, text, n, left=left, op=op, right=right))
+        elif bits not in known and bits not in staging:
+            staging[bits] = Expr(rv, text, n, left=ea, op=op, right=eb)
 
 
 # ── Main search ────────────────────────────────────────────────────────────────
 
-def find_expression(
+def find_expressions(
     target: float,
     max_lits: int = 7,
     time_limit: float = 60.0,
     verbose: bool = True,
-) -> "Expr | None":
+) -> list[Expr]:
     """
     Bottom-up DP search over arithmetic expression complexity.
 
     Explores expressions with 1, 2, 3, … *max_lits* numeric literals in order.
-    Returns the first (simplest) expression whose float value exactly matches
-    *target*, or None if none is found within the given limits.
+    Once the minimum literal count k that reaches *target* is found, the entire
+    level k is scanned so that ALL equally-parsimonious expressions are returned.
+    Returns an empty list if the target is not reached within the given limits.
     """
     target_bits = float_bits(target)
 
     known: dict[int, Expr] = build_atoms()
     if target_bits in known:
-        return known[target_bits]
+        return [known[target_bits]]
 
     by_level: dict[int, list[Expr]] = {}
     for e in known.values():
@@ -196,12 +211,12 @@ def find_expression(
             break
 
         staging: dict[int, Expr] = {}
+        hits: list[Expr] = []
+        seen_texts: set[str] = set()
         total_known = sum(len(v) for v in by_level.values())
 
         if verbose:
             print(f"  Level {k:2d}  ({total_known:>8,} values reachable) ...", end="", flush=True)
-
-        found: "Expr | None" = None
 
         for i in range(1, k):
             j = k - i
@@ -211,19 +226,12 @@ def find_expression(
                 if time.perf_counter() - t0 >= time_limit:
                     break
                 for eb in by_level[j]:
-                    hit = _expand(ea, eb, target_bits, known, staging)
-                    if hit is not None:
-                        found = hit
-                        break
-                if found:
-                    break
-            if found:
-                break
+                    _expand(ea, eb, target_bits, known, staging, hits, seen_texts)
 
-        if found is not None:
+        if hits:
             if verbose:
-                print("  ✓ FOUND!")
-            return found
+                print(f"  ✓ found {len(hits)} expression(s)!")
+            return hits
 
         for e in staging.values():
             u = ulp_dist(e.value, target)
@@ -254,7 +262,7 @@ def find_expression(
         print(f"\n  Closest expression found ({best_ulps} ULPs from target):")
         print(f"    {best_near.text}  =  {best_near.value!r}")
 
-    return None
+    return []
 
 
 # ── Template exploration ───────────────────────────────────────────────────────
@@ -272,26 +280,18 @@ def eval_tree(expr: Expr, sub: dict[int, float]) -> float:
     in *sub* with the corresponding new value.
     """
     if expr.left is None:
-        bits = float_bits(expr.value)
-        return sub.get(bits, expr.value)
+        return sub.get(float_bits(expr.value), expr.value)
     lv = eval_tree(expr.left, sub)
     rv = eval_tree(expr.right, sub)
-    if expr.op == '+':
-        return lv + rv
-    if expr.op == '-':
-        return lv - rv
-    if expr.op == '*':
-        return lv * rv
-    if expr.op == '/':
-        return lv / rv if rv != 0.0 else float('nan')
+    if expr.op == '+':  return lv + rv
+    if expr.op == '-':  return lv - rv
+    if expr.op == '*':  return lv * rv
+    if expr.op == '/':  return lv / rv if rv != 0.0 else float('nan')
     raise ValueError(f"Unknown op: {expr.op!r}")
 
 
 def _sweep_candidates() -> list[float]:
-    """
-    Build the candidate pool used when sweeping a single literal.
-    Covers integers, powers of 2/10, and common decimal fractions.
-    """
+    """Build the candidate pool used when sweeping a single literal."""
     seen: set[int] = set()
     cands: list[float] = []
 
@@ -303,26 +303,17 @@ def _sweep_candidates() -> list[float]:
             seen.add(b)
             cands.append(v)
 
-    # Integers 1 … 10 000
     for n in range(1, 10_001):
         add(float(n))
-
-    # Powers of 2 up to 2^30
     for k in range(31):
         add(2.0 ** k)
         add(-(2.0 ** k))
-
-    # Powers of 10
     for k in range(-10, 11):
         add(10.0 ** k)
-
-    # Decimal fractions d/10 and d/100
     for d in range(1, 100):
         add(d / 10.0)
         add(d / 100.0)
         add(d / 1000.0)
-
-    # Negative integers -1 … -1000
     for n in range(1, 1001):
         add(-float(n))
 
@@ -335,14 +326,13 @@ _SWEEP_CANDIDATES: "list[float] | None" = None  # lazily built
 def make_template_text(expr: Expr, param_names: dict[int, str]) -> str:
     """Render the expression with parameter names substituted for literals."""
     if expr.left is None:
-        bits = float_bits(expr.value)
-        return param_names.get(bits, expr.text)
-    left_s = make_template_text(expr.left, param_names)
+        return param_names.get(float_bits(expr.value), expr.text)
+    left_s  = make_template_text(expr.left,  param_names)
     right_s = make_template_text(expr.right, param_names)
     return f"({left_s} {expr.op} {right_s})"
 
 
-def explore_template(result: Expr, target: float, verbose: bool = True) -> None:
+def explore_template(result: Expr, target: float) -> None:
     """
     For each distinct literal value in *result*, sweep it over a large
     candidate set (keeping all other literals fixed) and report which
@@ -356,7 +346,6 @@ def explore_template(result: Expr, target: float, verbose: bool = True) -> None:
     target_bits = float_bits(target)
     leaves = collect_leaves(result)
 
-    # Distinct literal values, in order of first appearance
     seen_bits: set[int] = set()
     distinct: list[Expr] = []
     for leaf in leaves:
@@ -365,11 +354,10 @@ def explore_template(result: Expr, target: float, verbose: bool = True) -> None:
             seen_bits.add(b)
             distinct.append(leaf)
 
-    # Assign parameter names: N₀, N₁, … (or just the literal if unique)
-    param_names: dict[int, str] = {}
-    for idx, leaf in enumerate(distinct):
-        param_names[float_bits(leaf.value)] = f"N{idx}"
-
+    param_names: dict[int, str] = {
+        float_bits(leaf.value): f"N{idx}"
+        for idx, leaf in enumerate(distinct)
+    }
     template_str = make_template_text(result, param_names)
 
     print()
@@ -382,7 +370,6 @@ def explore_template(result: Expr, target: float, verbose: bool = True) -> None:
     for vary_idx, vary_leaf in enumerate(distinct):
         vary_bits = float_bits(vary_leaf.value)
         label = f"N{vary_idx}"
-
         fixed_desc = ", ".join(
             f"N{i}={d.value!r}"
             for i, d in enumerate(distinct)
@@ -395,9 +382,8 @@ def explore_template(result: Expr, target: float, verbose: bool = True) -> None:
 
         hits: list[float] = []
         for cand in _SWEEP_CANDIDATES:
-            sub = {vary_bits: cand}
             try:
-                rv = eval_tree(result, sub)
+                rv = eval_tree(result, {vary_bits: cand})
             except Exception:
                 continue
             if math.isfinite(rv) and float_bits(rv) == target_bits:
@@ -406,7 +392,6 @@ def explore_template(result: Expr, target: float, verbose: bool = True) -> None:
         if not hits:
             print(f"    No other values produce the target.")
         else:
-            # Split into positive/negative for readability
             pos = sorted(v for v in hits if v > 0)
             neg = sorted(v for v in hits if v < 0)
 
@@ -422,10 +407,6 @@ def explore_template(result: Expr, target: float, verbose: bool = True) -> None:
             if neg:
                 print(f"    Negative values that work ({len(neg)}):")
                 print(f"      {fmt_list(neg)}")
-
-            # Highlight if original value was in hits
-            if vary_leaf.value not in hits and vary_leaf.value in _SWEEP_CANDIDATES:
-                print(f"    (original value {vary_leaf.value!r} does NOT work in isolation)")
 
         print()
 
@@ -495,7 +476,7 @@ def main() -> None:
     print(f"  Searching: up to {args.max_literals} literals, time limit {args.time_limit:.0f}s")
     print()
 
-    result = find_expression(
+    results = find_expressions(
         target,
         max_lits=args.max_literals,
         time_limit=args.time_limit,
@@ -503,19 +484,21 @@ def main() -> None:
     )
 
     print()
-    if result is not None:
-        print("  ┌─ Result " + "─" * 51)
-        print(f"  │  Expression : {result.text}")
-        print(f"  │  Value      : {result.value!r}")
-        print(f"  │  Literals   : {result.n_lits}  (operations: {result.n_lits - 1})")
+    if results:
+        print(f"  ┌─ Result{'s' if len(results) > 1 else ''} ({len(results)} expression(s) at minimum complexity) " + "─" * 20)
+        for expr in results:
+            print(f"  │  {expr.text}")
+        print(f"  │")
+        print(f"  │  Value    : {results[0].value!r}")
+        print(f"  │  Literals : {results[0].n_lits}  (operations: {results[0].n_lits - 1})")
         print("  └" + "─" * 60)
         if rounded is not None and rounded != target:
             print()
             print(f"  Floating-point rounding accumulates through these operations,")
-            print(f"  giving {result.value!r} instead of {rounded!r}.")
+            print(f"  giving {results[0].value!r} instead of {rounded!r}.")
 
         if not args.no_explore:
-            explore_template(result, target, verbose=not args.quiet)
+            explore_template(results[0], target)
     else:
         print("  No exact match found within the given limits.")
         print(f"  Suggestions: -m {args.max_literals + 2}  or  -t {int(args.time_limit * 2)}")
